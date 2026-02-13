@@ -1,4 +1,4 @@
-#include "ref.h"
+#include "single_cycle_cpu.h"
 #include "CSR.h"
 #include "RISCV.h"
 #include "SimCpu.h"
@@ -9,14 +9,81 @@ extern "C" {
 #include "softfloat.h"
 }
 
-uint32_t (*g_ref_mem_read32_hook)(uint32_t paddr) = nullptr;
+CpuMemReadResult (*g_cpu_mem_read32_hook)(uint32_t paddr, uint32_t *data) =
+    nullptr;
+bool (*g_cpu_mem_read32_now_hook)(uint32_t paddr, uint32_t *data) = nullptr;
+bool (*g_cpu_mem_write32_now_hook)(uint32_t paddr, uint32_t data,
+                                   uint32_t wstrb) = nullptr;
 
-static inline uint32_t ref_phys_read32(uint32_t *memory, uint32_t paddr) {
-  if (g_ref_mem_read32_hook != nullptr) {
-    return g_ref_mem_read32_hook(paddr);
+static inline CpuMemReadResult cpu_phys_read32(uint32_t *memory, uint32_t paddr,
+                                               uint32_t *data) {
+  if (data == nullptr) {
+    return CPU_MEM_READ_FAULT;
   }
-  return memory[paddr >> 2];
+  (void)memory;
+  if (g_cpu_mem_read32_hook == nullptr) {
+    return CPU_MEM_READ_FAULT;
+  }
+  return g_cpu_mem_read32_hook(paddr, data);
 }
+
+static inline bool cpu_mem_read32_now(uint32_t paddr, uint32_t *data) {
+  if (data == nullptr || g_cpu_mem_read32_now_hook == nullptr) {
+    return false;
+  }
+  return g_cpu_mem_read32_now_hook(paddr, data);
+}
+
+static inline bool cpu_mem_write32_now(uint32_t paddr, uint32_t data,
+                                       uint32_t wstrb) {
+  if (g_cpu_mem_write32_now_hook == nullptr) {
+    return false;
+  }
+  return g_cpu_mem_write32_now_hook(paddr, data, wstrb);
+}
+
+static inline uint32_t ptw_cache_index(uint32_t paddr) {
+  return (paddr >> 2) & (SingleCycleCpu::kPtwCacheSize - 1);
+}
+
+void SingleCycleCpu::ptw_cache_reset() {
+  for (uint32_t i = 0; i < kPtwCacheSize; ++i) {
+    ptw_cache_valid[i] = false;
+    ptw_cache_tag[i] = 0;
+    ptw_cache_data[i] = 0;
+  }
+}
+
+bool SingleCycleCpu::ptw_cache_read(uint32_t paddr, uint32_t *data) {
+  if (data == nullptr) {
+    return false;
+  }
+  const uint32_t aligned = paddr & ~0x3u;
+  const uint32_t idx = ptw_cache_index(aligned);
+  if (!ptw_cache_valid[idx] || ptw_cache_tag[idx] != aligned) {
+    return false;
+  }
+  *data = ptw_cache_data[idx];
+  return true;
+}
+
+void SingleCycleCpu::ptw_cache_fill(uint32_t paddr, uint32_t data) {
+  const uint32_t aligned = paddr & ~0x3u;
+  const uint32_t idx = ptw_cache_index(aligned);
+  ptw_cache_valid[idx] = true;
+  ptw_cache_tag[idx] = aligned;
+  ptw_cache_data[idx] = data;
+}
+
+void SingleCycleCpu::ptw_cache_invalidate_word(uint32_t paddr) {
+  const uint32_t aligned = paddr & ~0x3u;
+  const uint32_t idx = ptw_cache_index(aligned);
+  if (ptw_cache_valid[idx] && ptw_cache_tag[idx] == aligned) {
+    ptw_cache_valid[idx] = false;
+  }
+}
+
+void SingleCycleCpu::ptw_cache_flush() { ptw_cache_reset(); }
 
 // ---------------- 辅助工具 ----------------
 static inline float32_t to_f32(uint32_t v) {
@@ -144,9 +211,9 @@ uint32_t f32_classify(float32_t f) {
   return res;
 }
 
-void RefCpu::init(uint32_t reset_pc) {
+void SingleCycleCpu::init(uint32_t reset_pc) {
   state.pc = reset_pc;
-  memory = new uint32_t[PHYSICAL_MEMORY_LENGTH];
+  memory = nullptr;
   for (int i = 0; i < 32; i++) {
     state.gpr[i] = 0;
   }
@@ -161,31 +228,36 @@ void RefCpu::init(uint32_t reset_pc) {
   page_fault_inst = false;
   page_fault_load = false;
   page_fault_store = false;
+  translation_pending = false;
+  ptw_cache_reset();
 }
 
-void RefCpu::exec() {
+void SingleCycleCpu::exec() {
   is_csr = is_exception = is_br = br_taken = false;
   illegal_exception = page_fault_load = page_fault_inst = page_fault_store =
       asy = false;
+  translation_pending = false;
   state.store = false;
 
   uint32_t p_addr = state.pc;
 
   if ((state.csr[csr_satp] & 0x80000000) && privilege != 3) {
-    if (fast_run) {
-      page_fault_inst = !va2pa(p_addr, state.pc, 0);
-    } else {
-      page_fault_inst = !va2pa_fixed(p_addr, state.pc, 0);
+    page_fault_inst = !va2pa(p_addr, state.pc, 0);
+
+    if (translation_pending) {
+      return;
     }
 
     if (page_fault_inst) {
       exception(state.pc);
       return;
-    } else {
-      Instruction = memory[p_addr >> 2];
     }
-  } else {
-    Instruction = memory[p_addr >> 2];
+  }
+
+  if (!cpu_mem_read32_now(p_addr, &Instruction)) {
+    illegal_exception = true;
+    exception(state.pc);
+    return;
   }
 
   if (Instruction == INST_EBREAK) {
@@ -202,7 +274,7 @@ void RefCpu::exec() {
   RISCV();
 }
 
-void RefCpu::exception(uint32_t trap_val) {
+void SingleCycleCpu::exception(uint32_t trap_val) {
   is_exception = true;
   uint32_t next_pc = state.pc + 4;
 
@@ -409,7 +481,7 @@ void RefCpu::exception(uint32_t trap_val) {
   state.pc = next_pc;
 }
 
-void RefCpu::RISCV() {
+void SingleCycleCpu::RISCV() {
   // === 优化 1: 极速解码 ===
   // 使用 BITS 宏直接提取字段，完全替代 bool 数组操作
   uint32_t opcode = BITS(Instruction, 6, 0);
@@ -526,7 +598,7 @@ void RefCpu::RISCV() {
   state.gpr[0] = 0;
 }
 
-void RefCpu::RV32Zfinx() {
+void SingleCycleCpu::RV32Zfinx() {
 
   uint32_t next_pc = state.pc + 4;
   // 1. 解码基础字段
@@ -745,7 +817,7 @@ skip_flags_update:
   state.pc = next_pc;
 }
 
-void RefCpu::RV32CSR() {
+void SingleCycleCpu::RV32CSR() {
   // pc + 4
   uint32_t next_pc = state.pc + 4;
 
@@ -839,6 +911,9 @@ void RefCpu::RV32CSR() {
 
       } else {
         state.csr[csr_idx] = csr_wdata;
+        if (csr_idx == csr_satp) {
+          ptw_cache_flush();
+        }
       }
     }
   }
@@ -846,7 +921,7 @@ void RefCpu::RV32CSR() {
   state.pc = next_pc;
 }
 
-void RefCpu::RV32A() {
+void SingleCycleCpu::RV32A() {
   // pc + 4
   uint32_t next_pc = state.pc + 4;
   uint32_t funct5 = BITS(Instruction, 31, 27);
@@ -862,20 +937,14 @@ void RefCpu::RV32A() {
 
   if ((state.csr[csr_satp] & 0x80000000) && privilege != 3) {
     bool page_fault;
-
-    if (fast_run) {
-      if (funct5 == 2) {
-        page_fault = !va2pa(p_addr, v_addr, 1);
-      } else {
-        page_fault = !va2pa(p_addr, v_addr, 2);
-      }
+    if (funct5 == 2) {
+      page_fault = !va2pa(p_addr, v_addr, 1);
     } else {
+      page_fault = !va2pa(p_addr, v_addr, 2);
+    }
 
-      if (funct5 == 2) {
-        page_fault = !va2pa_fixed(p_addr, v_addr, 1);
-      } else {
-        page_fault = !va2pa_fixed(p_addr, v_addr, 2);
-      }
+    if (translation_pending) {
+      return;
     }
 
     if (page_fault) {
@@ -898,19 +967,26 @@ void RefCpu::RV32A() {
     state.store_strb = 0b1111;
   }
 
+  uint32_t old_word = 0;
+  if (!cpu_mem_read32_now(p_addr, &old_word)) {
+    illegal_exception = true;
+    exception(v_addr);
+    return;
+  }
+
   switch (funct5) {
   case 0: { // amoadd.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = memory[p_addr >> 2] + reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data = old_word + reg_rdata2;
     break;
   }
   case 1: { // amoswap.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
+    state.gpr[reg_d_index] = old_word;
     state.store_data = reg_rdata2;
     break;
   }
   case 2: { // lr.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
+    state.gpr[reg_d_index] = old_word;
     break;
   }
   case 3: { // sc.w
@@ -919,46 +995,42 @@ void RefCpu::RV32A() {
     break;
   }
   case 4: { // amoxor.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = memory[p_addr >> 2] ^ reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data = old_word ^ reg_rdata2;
     break;
   }
   case 8: { // amoor.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = memory[p_addr >> 2] | reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data = old_word | reg_rdata2;
     break;
   }
   case 12: { // amoand.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = memory[p_addr >> 2] & reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data = old_word & reg_rdata2;
     break;
   }
   case 16: { // amomin.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = ((int32_t)memory[p_addr >> 2] > (int32_t)reg_rdata2)
-                           ? reg_rdata2
-                           : memory[p_addr >> 2];
+    state.gpr[reg_d_index] = old_word;
+    state.store_data =
+        ((int32_t)old_word > (int32_t)reg_rdata2) ? reg_rdata2 : old_word;
     break;
   }
   case 20: { // amomax.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = ((int32_t)memory[p_addr >> 2] > (int32_t)reg_rdata2)
-                           ? memory[p_addr >> 2]
-                           : reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data =
+        ((int32_t)old_word > (int32_t)reg_rdata2) ? old_word : reg_rdata2;
     break;
   }
   case 24: { // amominu.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = ((uint32_t)memory[p_addr >> 2] < (uint32_t)reg_rdata2)
-                           ? memory[p_addr >> 2]
-                           : reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data =
+        ((uint32_t)old_word < (uint32_t)reg_rdata2) ? old_word : reg_rdata2;
     break;
   }
   case 28: { // amomaxu.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = ((uint32_t)memory[p_addr >> 2] > (uint32_t)reg_rdata2)
-                           ? memory[p_addr >> 2]
-                           : reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data =
+        ((uint32_t)old_word > (uint32_t)reg_rdata2) ? old_word : reg_rdata2;
     break;
   }
   default: {
@@ -970,7 +1042,7 @@ void RefCpu::RV32A() {
   state.pc = next_pc;
 }
 
-void RefCpu::RV32IM() {
+void SingleCycleCpu::RV32IM() {
   // pc + 4
   uint32_t next_pc = state.pc + 4;
   uint32_t opcode = BITS(Instruction, 6, 0);
@@ -1060,10 +1132,11 @@ void RefCpu::RV32IM() {
     uint32_t v_addr = reg_rdata1 + immI(Instruction);
     uint32_t p_addr = v_addr;
     if ((state.csr[csr_satp] & 0x80000000) && privilege != 3) {
-      if (fast_run)
-        page_fault_load = !va2pa(p_addr, v_addr, 1);
-      else
-        page_fault_load = !va2pa_fixed(p_addr, v_addr, 1);
+      page_fault_load = !va2pa(p_addr, v_addr, 1);
+    }
+
+    if (translation_pending) {
+      return;
     }
 
     if (page_fault_load) {
@@ -1071,7 +1144,12 @@ void RefCpu::RV32IM() {
       return;
 
     } else {
-      uint32_t data = memory[p_addr >> 2];
+      uint32_t data = 0;
+      if (!cpu_mem_read32_now(p_addr, &data)) {
+        illegal_exception = true;
+        exception(v_addr);
+        return;
+      }
       uint32_t offset = p_addr & 0b11;
       uint32_t size = funct3 & 0b11;
       uint32_t sign = 0, mask;
@@ -1111,10 +1189,11 @@ void RefCpu::RV32IM() {
     uint32_t v_addr = reg_rdata1 + immS(Instruction);
     uint32_t p_addr = v_addr;
     if ((state.csr[csr_satp] & 0x80000000) && privilege != 3) {
-      if (fast_run)
-        page_fault_store = !va2pa(p_addr, v_addr, 2);
-      else
-        page_fault_store = !va2pa_fixed(p_addr, v_addr, 2);
+      page_fault_store = !va2pa(p_addr, v_addr, 2);
+    }
+
+    if (translation_pending) {
+      return;
     }
 
     if (page_fault_store) {
@@ -1329,13 +1408,18 @@ void RefCpu::RV32IM() {
   state.pc = next_pc;
 }
 
-void RefCpu::store_data() {
+void SingleCycleCpu::store_data() {
 
   uint32_t p_addr = state.store_addr;
+  uint32_t word_addr = p_addr & ~0x3u;
   int offset = p_addr & 0x3;
   uint32_t wstrb = state.store_strb << offset;
   uint32_t wdata = state.store_data << (offset * 8);
-  uint32_t old_data = memory[p_addr / 4];
+  uint32_t old_data = 0;
+  if (!cpu_mem_read32_now(word_addr, &old_data)) {
+    illegal_exception = true;
+    return;
+  }
   uint32_t mask = 0;
 
   if (wstrb & 0b1)
@@ -1354,30 +1438,59 @@ void RefCpu::store_data() {
   /*  exit(-1);*/
   /*}*/
 
-  memory[p_addr / 4] = (mask & wdata) | (~mask & old_data);
+  uint32_t merged_data = (mask & wdata) | (~mask & old_data);
+  if (!cpu_mem_write32_now(word_addr, merged_data, 0xFu)) {
+    illegal_exception = true;
+    return;
+  }
+  ptw_cache_invalidate_word(word_addr);
 
   if (p_addr == UART_BASE) {
     char temp;
     temp = wdata & 0x000000ff;
-    memory[0x10000000 / 4] = memory[0x10000000 / 4] & 0xffffff00;
+    uint32_t uart_reg = 0;
+    if (!cpu_mem_read32_now(0x10000000u, &uart_reg) ||
+        !cpu_mem_write32_now(0x10000000u, uart_reg & 0xffffff00u, 0xFu)) {
+      illegal_exception = true;
+      return;
+    }
+    ptw_cache_invalidate_word(0x10000000u);
     if (fast_run)
       cout << temp;
   }
 
   if (p_addr == 0x10000001 && (state.store_data & 0x000000ff) == 7) {
-    memory[0xc201004 / 4] = 0xa;
-    memory[0x10000000 / 4] = memory[0x10000000 / 4] & 0xfff0ffff;
+    uint32_t uart_reg = 0;
+    if (!cpu_mem_write32_now(0x0c201004u, 0xau, 0xFu) ||
+        !cpu_mem_read32_now(0x10000000u, &uart_reg) ||
+        !cpu_mem_write32_now(0x10000000u, uart_reg & 0xfff0ffffu, 0xFu)) {
+      illegal_exception = true;
+      return;
+    }
+    ptw_cache_invalidate_word(0x0c201004u);
+    ptw_cache_invalidate_word(0x10000000u);
 
     state.csr[csr_mip] = state.csr[csr_mip] | (1 << 9);
     state.csr[csr_sip] = state.csr[csr_sip] | (1 << 9);
   }
 
   if (p_addr == 0x10000001 && (state.store_data & 0x000000ff) == 5) {
-    memory[0x10000000 / 4] = memory[0x10000000 / 4] & 0xfff0ffff | 0x00030000;
+    uint32_t uart_reg = 0;
+    if (!cpu_mem_read32_now(0x10000000u, &uart_reg) ||
+        !cpu_mem_write32_now(0x10000000u,
+                             (uart_reg & 0xfff0ffffu) | 0x00030000u, 0xFu)) {
+      illegal_exception = true;
+      return;
+    }
+    ptw_cache_invalidate_word(0x10000000u);
   }
 
   if (p_addr == 0xc201004 && (state.store_data & 0x000000ff) == 0xa) {
-    memory[0xc201004 / 4] = 0x0;
+    if (!cpu_mem_write32_now(0x0c201004u, 0x0u, 0xFu)) {
+      illegal_exception = true;
+      return;
+    }
+    ptw_cache_invalidate_word(0x0c201004u);
     state.csr[csr_mip] = state.csr[csr_mip] & ~(1 << 9);
     state.csr[csr_sip] = state.csr[csr_sip] & ~(1 << 9);
   }
@@ -1386,7 +1499,9 @@ void RefCpu::store_data() {
   state.store_strb = state.store_strb << offset * 8;
 }
 
-bool RefCpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
+bool SingleCycleCpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
+  translation_pending = false;
+
   uint32_t mstatus = state.csr[csr_mstatus];
   uint32_t sstatus = state.csr[csr_sstatus];
   uint32_t satp = state.csr[csr_satp];
@@ -1414,7 +1529,18 @@ bool RefCpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
   uint32_t pte1_addr = (ppn_root << 12) | (vpn1 << 2);
 
   // 直接读取，注意这里需要确保 memory 是按字寻址还是字节寻址
-  uint32_t pte1 = ref_phys_read32(memory, pte1_addr);
+  uint32_t pte1 = 0;
+  if (!ptw_cache_read(pte1_addr, &pte1)) {
+    CpuMemReadResult pte1_result = cpu_phys_read32(memory, pte1_addr, &pte1);
+    if (pte1_result == CPU_MEM_READ_PENDING) {
+      translation_pending = true;
+      return false;
+    }
+    if (pte1_result != CPU_MEM_READ_OK) {
+      return false;
+    }
+    ptw_cache_fill(pte1_addr, pte1);
+  }
 
   // 3. 检查 PTE 有效性
   // !V 或者 (!R && W) 都是无效的
@@ -1469,7 +1595,18 @@ bool RefCpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
   uint32_t vpn0 = (v_addr >> 12) & 0x3FF;
   uint32_t pte2_addr = (ppn1 << 12) | (vpn0 << 2);
 
-  uint32_t pte2 = ref_phys_read32(memory, pte2_addr);
+  uint32_t pte2 = 0;
+  if (!ptw_cache_read(pte2_addr, &pte2)) {
+    CpuMemReadResult pte2_result = cpu_phys_read32(memory, pte2_addr, &pte2);
+    if (pte2_result == CPU_MEM_READ_PENDING) {
+      translation_pending = true;
+      return false;
+    }
+    if (pte2_result != CPU_MEM_READ_OK) {
+      return false;
+    }
+    ptw_cache_fill(pte2_addr, pte2);
+  }
 
   // 重复有效性检查
   if (!(pte2 & PTE_V) || (!(pte2 & PTE_R) && (pte2 & PTE_W))) {
@@ -1510,17 +1647,4 @@ bool RefCpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
   }
 
   return false; // 如果 Level 2 还不是叶子节点，则是非法页表
-}
-
-/*
- * va2pa_fixed: a fixed version of va2pa
- *
- * 基本功能几乎与 va2pa() 相同；但当 dut.cpu 检测到 page fault 时，
- * 以 dut.cpu 的结果为准，
- *
- * 目的：当 SFENCE.VMA 还没有执行、存在两种合法的页表映射时，保证
- * DUT 与参考模型的页表映射一致，避免 difftest 失败。
- */
-bool RefCpu::va2pa_fixed(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
-  return va2pa(p_addr, v_addr, type);
 }

@@ -73,7 +73,7 @@ typedef struct CPU_state {
   bool store;
 } CPU_state;
 
-class RefCpu {
+class SingleCycleCpu {
 public:
   uint32_t *memory;
   uint32_t Instruction;
@@ -84,6 +84,7 @@ public:
   bool page_fault_load;
   bool page_fault_store;
   bool illegal_exception;
+  bool translation_pending;
 
   bool M_software_interrupt;
   bool M_timer_interrupt;
@@ -106,15 +107,36 @@ public:
   void exception(uint32_t trap_val);
   void store_data();
   bool va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type);
-  bool va2pa_fixed(uint32_t &p_addr, uint32_t v_addr, uint32_t type);
 
   bool is_br;
   bool br_taken;
 
   bool is_csr;
   bool is_exception;
+
+  static constexpr uint32_t kPtwCacheSize = 512;
+  uint32_t ptw_cache_tag[kPtwCacheSize];
+  uint32_t ptw_cache_data[kPtwCacheSize];
+  bool ptw_cache_valid[kPtwCacheSize];
+  void ptw_cache_reset();
+  bool ptw_cache_read(uint32_t paddr, uint32_t *data);
+  void ptw_cache_fill(uint32_t paddr, uint32_t data);
+  void ptw_cache_invalidate_word(uint32_t paddr);
+  void ptw_cache_flush();
 };
 
-// Optional physical-memory read hook (used by va2pa page-table walk).
-// If null, RefCpu falls back to direct `memory[]` read.
-extern uint32_t (*g_ref_mem_read32_hook)(uint32_t paddr);
+enum CpuMemReadResult : uint8_t {
+  CPU_MEM_READ_OK = 0,
+  CPU_MEM_READ_PENDING = 1,
+  CPU_MEM_READ_FAULT = 2,
+};
+
+// Physical-memory read hook used by va2pa page-table walk (supports pending).
+extern CpuMemReadResult (*g_cpu_mem_read32_hook)(uint32_t paddr,
+                                                  uint32_t *data);
+
+// Immediate read/write hooks used by instruction/load/store/amo paths.
+// These hooks must be provided by the embedding runtime.
+extern bool (*g_cpu_mem_read32_now_hook)(uint32_t paddr, uint32_t *data);
+extern bool (*g_cpu_mem_write32_now_hook)(uint32_t paddr, uint32_t data,
+                                          uint32_t wstrb);

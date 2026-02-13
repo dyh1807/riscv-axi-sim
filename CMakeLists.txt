@@ -12,13 +12,13 @@ set(DEMO_SHARED_EXE demo_api_shared.out)
 
 set(CORE_SOURCES
     src/sc_axi4_sim_api.cpp
-    src/ref/ref_standalone.cpp
+    src/cpu/single_cycle_cpu_standalone.cpp
     src/axi/AXI_Interconnect.cpp
 )
 
 set(COMMON_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src/ref/include
+    ${CMAKE_SOURCE_DIR}/src/cpu/include
     ${CMAKE_SOURCE_DIR}/src/axi/include
     ${CMAKE_SOURCE_DIR}/src/simddr/include
 )

@@ -4,4 +4,4 @@
 #undef CONFIG_LOOSE_VA2PA
 #endif
 
-#include "ref.cpp"
+#include "single_cycle_cpu.cpp"

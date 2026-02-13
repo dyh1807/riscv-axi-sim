@@ -3,7 +3,7 @@ CXXFLAGS := -O3 -march=native -funroll-loops -mtune=native --std=c++2a
 CXXFLAGS += -DUSE_SIM_DDR -DUSE_SIM_DDR_AXI4 -DICACHE_MISS_LATENCY=8
 
 INCLUDES := -I./include \
-            -I./src/ref/include \
+            -I./src/cpu/include \
             -I./src/simddr/include \
             -I./src/axi/include
 
@@ -11,7 +11,7 @@ LDFLAGS := -lz -lstdc++fs
 LIBS := ./third_party/softfloat/softfloat.a
 
 CORE_SRCS := src/sc_axi4_sim_api.cpp \
-             src/ref/ref_standalone.cpp \
+             src/cpu/single_cycle_cpu_standalone.cpp \
              src/axi/AXI_Interconnect.cpp
 
 EXE_SRCS := src/main.cpp \

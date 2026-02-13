@@ -5,7 +5,7 @@
 #include "RISCV.h"
 #include "SimCpu.h"
 #include "config.h"
-#include "ref.h"
+#include "single_cycle_cpu.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -24,6 +24,14 @@ namespace {
 constexpr uint32_t kImageBase = 0x80000000u;
 constexpr uint8_t kFetchReqId = 0;
 constexpr uint8_t kDataReqId = 1;
+constexpr uint8_t kMmuReqId = 2;
+
+class SingleCycleAxi4Sim;
+static SingleCycleAxi4Sim *g_active_sim = nullptr;
+static CpuMemReadResult cpu_mem_read_hook(uint32_t paddr, uint32_t *data);
+static bool cpu_mem_read_now_hook(uint32_t paddr, uint32_t *data);
+static bool cpu_mem_write_now_hook(uint32_t paddr, uint32_t data,
+                                   uint32_t wstrb);
 
 inline int32_t sext(uint32_t value, int bits) {
   const uint32_t sign_bit = 1u << (bits - 1);
@@ -92,10 +100,38 @@ struct WriteReqState {
 enum class ExecStage : uint8_t {
   kPrepareFetch = 0,
   kWaitFetch = 1,
-  kWaitData = 2,
-  kExecute = 3,
-  kWaitAmoWrite = 4,
-  kHalted = 5,
+  kPrepareData = 2,
+  kWaitData = 3,
+  kExecute = 4,
+  kWaitAmoWrite = 5,
+  kHalted = 6,
+};
+
+static const char *stage_name(ExecStage stage) {
+  switch (stage) {
+  case ExecStage::kPrepareFetch:
+    return "PrepareFetch";
+  case ExecStage::kWaitFetch:
+    return "WaitFetch";
+  case ExecStage::kPrepareData:
+    return "PrepareData";
+  case ExecStage::kWaitData:
+    return "WaitData";
+  case ExecStage::kExecute:
+    return "Execute";
+  case ExecStage::kWaitAmoWrite:
+    return "WaitAmoWrite";
+  case ExecStage::kHalted:
+    return "Halted";
+  }
+  return "Unknown";
+}
+
+struct MmuHookState {
+  bool pending = false;
+  bool response_valid = false;
+  uint32_t addr = 0;
+  uint32_t data = 0;
 };
 
 class SingleCycleAxi4Sim {
@@ -103,6 +139,12 @@ public:
   SingleCycleAxi4Sim() { init_runtime(); }
 
   ~SingleCycleAxi4Sim() {
+    if (g_active_sim == this) {
+      g_active_sim = nullptr;
+      g_cpu_mem_read32_hook = nullptr;
+      g_cpu_mem_read32_now_hook = nullptr;
+      g_cpu_mem_write32_now_hook = nullptr;
+    }
     if (p_memory != nullptr) {
       delete[] p_memory;
       p_memory = nullptr;
@@ -209,6 +251,41 @@ public:
     return last_error_.c_str();
   }
 
+  CpuMemReadResult on_cpu_mem_read(uint32_t paddr, uint32_t *data) {
+    if (data == nullptr || p_memory == nullptr) {
+      return CPU_MEM_READ_FAULT;
+    }
+
+    const uint32_t aligned_addr = paddr & ~0x3u;
+    if (mmu_hook_.response_valid && mmu_hook_.addr != aligned_addr) {
+      mmu_hook_.response_valid = false;
+      mmu_hook_.pending = false;
+    }
+
+    if (mmu_hook_.response_valid && mmu_hook_.addr == aligned_addr) {
+      *data = mmu_hook_.data;
+      mmu_hook_.response_valid = false;
+      mmu_hook_.pending = false;
+      return CPU_MEM_READ_OK;
+    }
+
+    if (mmu_hook_.pending && !mmu_req_.active && !mmu_hook_.response_valid) {
+      mmu_hook_.pending = false;
+    }
+
+    if (mmu_hook_.pending) {
+      return CPU_MEM_READ_PENDING;
+    }
+
+    mmu_hook_.pending = true;
+    mmu_hook_.response_valid = false;
+    mmu_hook_.addr = aligned_addr;
+    mmu_hook_.data = 0;
+    setup_read(mmu_req_, axi_interconnect::MASTER_MMU, kMmuReqId, aligned_addr,
+               3);
+    return CPU_MEM_READ_PENDING;
+  }
+
 private:
   void init_runtime() {
     if (p_memory == nullptr) {
@@ -240,14 +317,23 @@ private:
     pre_req_ = {};
     fetch_req_ = {};
     data_req_ = {};
+    mmu_req_ = {};
     write_req_ = {};
+    mmu_req_ready_ = false;
+    mmu_resp_valid_ = false;
+    mmu_hook_ = {};
     uart_valid_ = false;
     uart_ch_ = 0;
+    last_inst_count_ = 0;
+    last_progress_time_ = 0;
+    stall_reported_ = false;
 
-    ref_cpu_.init(0);
-    delete[] ref_cpu_.memory;
-    ref_cpu_.memory = p_memory;
-    g_ref_mem_read32_hook = nullptr;
+    cpu_core_.init(0);
+    cpu_core_.memory = p_memory;
+    g_active_sim = this;
+    g_cpu_mem_read32_hook = cpu_mem_read_hook;
+    g_cpu_mem_read32_now_hook = cpu_mem_read_now_hook;
+    g_cpu_mem_write32_now_hook = cpu_mem_write_now_hook;
     interconnect_.init();
   }
 
@@ -264,17 +350,17 @@ private:
 
   void set_error(const std::string &error) { last_error_ = error; }
 
-  static bool translate_addr(RefCpu &ref_cpu, uint32_t vaddr, uint32_t type,
+  static bool translate_addr(SingleCycleCpu &cpu_core, uint32_t vaddr, uint32_t type,
                              uint32_t &paddr) {
-    if ((ref_cpu.state.csr[csr_satp] & 0x80000000u) &&
-        ref_cpu.privilege != RISCV_MODE_M) {
-      return ref_cpu.va2pa(paddr, vaddr, type);
+    if ((cpu_core.state.csr[csr_satp] & 0x80000000u) &&
+        cpu_core.privilege != RISCV_MODE_M) {
+      return cpu_core.va2pa(paddr, vaddr, type);
     }
     paddr = vaddr;
     return true;
   }
 
-  static DecodedMemReq decode_mem_req_pre_exec(RefCpu &ref_cpu,
+  static DecodedMemReq decode_mem_req_pre_exec(SingleCycleCpu &cpu_core,
                                                uint32_t inst_word) {
     DecodedMemReq req{};
     const uint32_t opcode = inst_word & 0x7f;
@@ -286,8 +372,8 @@ private:
 
     if (opcode == 0x03) {
       const int32_t imm_i = sext((inst_word >> 20) & 0xfff, 12);
-      vaddr = ref_cpu.state.gpr[rs1] + static_cast<uint32_t>(imm_i);
-      if (!translate_addr(ref_cpu, vaddr, 1, paddr)) {
+      vaddr = cpu_core.state.gpr[rs1] + static_cast<uint32_t>(imm_i);
+      if (!translate_addr(cpu_core, vaddr, 1, paddr)) {
         return req;
       }
       req.valid = true;
@@ -315,9 +401,9 @@ private:
     if (opcode == 0x23) {
       const uint32_t imm = ((inst_word >> 25) << 5) | ((inst_word >> 7) & 0x1f);
       const int32_t imm_s = sext(imm, 12);
-      const uint32_t rs2_data = ref_cpu.state.gpr[rs2];
-      vaddr = ref_cpu.state.gpr[rs1] + static_cast<uint32_t>(imm_s);
-      if (!translate_addr(ref_cpu, vaddr, 2, paddr)) {
+      const uint32_t rs2_data = cpu_core.state.gpr[rs2];
+      vaddr = cpu_core.state.gpr[rs1] + static_cast<uint32_t>(imm_s);
+      if (!translate_addr(cpu_core, vaddr, 2, paddr)) {
         return req;
       }
       const uint32_t offset = paddr & 0x3u;
@@ -348,8 +434,8 @@ private:
     }
 
     if (opcode == 0x2f) {
-      const uint32_t vaddr_amo = ref_cpu.state.gpr[rs1];
-      if (!translate_addr(ref_cpu, vaddr_amo, 1, paddr)) {
+      const uint32_t vaddr_amo = cpu_core.state.gpr[rs1];
+      if (!translate_addr(cpu_core, vaddr_amo, 1, paddr)) {
         return req;
       }
       req.valid = true;
@@ -445,11 +531,32 @@ private:
     interconnect_.write_port.resp.ready = false;
   }
 
+  void drive_mmu_request() {
+    mmu_req_ready_ = false;
+    mmu_resp_valid_ = false;
+
+    if (!mmu_req_.active) {
+      return;
+    }
+
+    auto &port = interconnect_.read_ports[axi_interconnect::MASTER_MMU];
+    mmu_req_ready_ = port.req.ready;
+    mmu_resp_valid_ = port.resp.valid;
+    port.resp.ready = true;
+
+    // Keep req.valid asserted while active to avoid missing ready-first pulses.
+    port.req.valid = true;
+    port.req.addr = mmu_req_.addr;
+    port.req.total_size = mmu_req_.total_size;
+    port.req.id = mmu_req_.id;
+  }
+
   void drive_current_stage(bool &req_ready, bool &resp_valid) {
     req_ready = false;
     resp_valid = false;
 
-    if (stage_ == ExecStage::kWaitFetch) {
+    switch (stage_) {
+    case ExecStage::kWaitFetch: {
       auto &port = interconnect_.read_ports[axi_interconnect::MASTER_ICACHE];
       req_ready = port.req.ready;
       resp_valid = port.resp.valid;
@@ -460,10 +567,9 @@ private:
         port.req.total_size = fetch_req_.total_size;
         port.req.id = fetch_req_.id;
       }
-      return;
+      break;
     }
-
-    if (stage_ == ExecStage::kWaitData) {
+    case ExecStage::kWaitData: {
       if (pre_req_.is_read) {
         auto &port = interconnect_.read_ports[axi_interconnect::MASTER_DCACHE_R];
         req_ready = port.req.ready;
@@ -490,10 +596,9 @@ private:
           port.req.id = write_req_.id;
         }
       }
-      return;
+      break;
     }
-
-    if (stage_ == ExecStage::kWaitAmoWrite) {
+    case ExecStage::kWaitAmoWrite: {
       auto &port = interconnect_.write_port;
       req_ready = port.req.ready;
       resp_valid = port.resp.valid;
@@ -507,7 +612,13 @@ private:
         port.req.total_size = write_req_.total_size;
         port.req.id = write_req_.id;
       }
+      break;
     }
+    default:
+      break;
+    }
+
+    drive_mmu_request();
   }
 
   void mirror_read_data(const sc_axi4_in_t &axi_in, const sc_axi4_out_t &axi_out) {
@@ -521,6 +632,16 @@ private:
       const uint32_t word_addr = (fetch_req_.addr >> 2) + fetch_req_.beats_seen;
       p_memory[word_addr] = axi_in.rdata;
       fetch_req_.beats_seen++;
+      return;
+    }
+
+    if (mmu_req_.active && mmu_req_.issued &&
+        axi_in.rid == encode_axi_id(mmu_req_.master, mmu_req_.id) &&
+        mmu_req_.beats_seen < mmu_req_.beats_total) {
+      const uint32_t word_addr = (mmu_req_.addr >> 2) + mmu_req_.beats_seen;
+      p_memory[word_addr] = axi_in.rdata;
+      mmu_hook_.data = axi_in.rdata;
+      mmu_req_.beats_seen++;
       return;
     }
 
@@ -559,37 +680,44 @@ private:
     }
   }
 
-  void update_stage_after_cycle(bool req_ready, bool resp_valid) {
-    if (stage_ == ExecStage::kPrepareFetch) {
-      prepare_fetch();
+  void update_mmu_request_state() {
+    if (!mmu_req_.active) {
       return;
     }
 
-    if (stage_ == ExecStage::kWaitFetch) {
+    if (!mmu_req_.issued && mmu_req_ready_) {
+      mmu_req_.issued = true;
+    }
+    if (mmu_req_.issued && mmu_resp_valid_) {
+      mmu_req_.active = false;
+      mmu_hook_.response_valid = true;
+      if (p_memory != nullptr) {
+        mmu_hook_.data = p_memory[mmu_hook_.addr >> 2];
+      }
+    }
+  }
+
+  void update_stage_after_cycle(bool req_ready, bool resp_valid) {
+    update_mmu_request_state();
+
+    switch (stage_) {
+    case ExecStage::kPrepareFetch:
+      prepare_fetch();
+      break;
+    case ExecStage::kWaitFetch:
       if (!fetch_req_.issued && req_ready) {
         fetch_req_.issued = true;
       }
       if (fetch_req_.issued && resp_valid) {
         fetch_req_.active = false;
         inst_word_ = fetch_ok_ ? p_memory[fetch_paddr_ >> 2] : 0u;
-        pre_req_ = decode_mem_req_pre_exec(ref_cpu_, inst_word_);
-        if (pre_req_.valid) {
-          if (pre_req_.is_read) {
-            setup_read(data_req_, axi_interconnect::MASTER_DCACHE_R, kDataReqId,
-                       pre_req_.paddr, pre_req_.total_size);
-          } else {
-            setup_write(write_req_, kDataReqId, pre_req_.paddr, pre_req_.wdata,
-                        static_cast<uint8_t>(pre_req_.wstrb), pre_req_.total_size);
-          }
-          stage_ = ExecStage::kWaitData;
-        } else {
-          stage_ = ExecStage::kExecute;
-        }
+        stage_ = ExecStage::kPrepareData;
       }
-      return;
-    }
-
-    if (stage_ == ExecStage::kWaitData) {
+      break;
+    case ExecStage::kPrepareData:
+      prepare_data_request();
+      break;
+    case ExecStage::kWaitData:
       if (pre_req_.is_read) {
         if (!data_req_.issued && req_ready) {
           data_req_.issued = true;
@@ -607,35 +735,39 @@ private:
           stage_ = ExecStage::kExecute;
         }
       }
-      return;
-    }
-
-    if (stage_ == ExecStage::kExecute) {
-      ref_cpu_.exec();
+      break;
+    case ExecStage::kExecute:
+      cpu_core_.exec();
+      if (cpu_core_.translation_pending) {
+        break;
+      }
       inst_count_++;
+      last_progress_time_ = static_cast<uint64_t>(sim_time);
+      if (inst_count_ != last_inst_count_) {
+        last_inst_count_ = inst_count_;
+        stall_reported_ = false;
+      }
 
       if (inst_word_ == INST_EBREAK) {
         halted_reason_ebreak_ = true;
         stage_ = ExecStage::kHalted;
         success_ = true;
-        return;
+        break;
       }
 
-      if (((inst_word_ & 0x7f) == 0x2f) && ref_cpu_.state.store) {
+      if (((inst_word_ & 0x7f) == 0x2f) && cpu_core_.state.store) {
         const uint8_t amo_wstrb =
-            static_cast<uint8_t>(ref_cpu_.state.store_strb & 0xfu);
-        setup_write(write_req_, kDataReqId, ref_cpu_.state.store_addr,
-                    ref_cpu_.state.store_data,
+            static_cast<uint8_t>(cpu_core_.state.store_strb & 0xfu);
+        setup_write(write_req_, kDataReqId, cpu_core_.state.store_addr,
+                    cpu_core_.state.store_data,
                     static_cast<uint8_t>(amo_wstrb == 0 ? 0xfu : amo_wstrb), 3);
         stage_ = ExecStage::kWaitAmoWrite;
-        return;
+        break;
       }
 
       stage_ = ExecStage::kPrepareFetch;
-      return;
-    }
-
-    if (stage_ == ExecStage::kWaitAmoWrite) {
+      break;
+    case ExecStage::kWaitAmoWrite:
       if (!write_req_.issued && req_ready) {
         write_req_.issued = true;
       }
@@ -643,12 +775,18 @@ private:
         write_req_.active = false;
         stage_ = ExecStage::kPrepareFetch;
       }
+      break;
+    case ExecStage::kHalted:
+      break;
     }
   }
 
   void prepare_fetch() {
-    fetch_vaddr_ = ref_cpu_.state.pc;
-    fetch_ok_ = translate_addr(ref_cpu_, fetch_vaddr_, 0, fetch_paddr_);
+    fetch_vaddr_ = cpu_core_.state.pc;
+    fetch_ok_ = translate_addr(cpu_core_, fetch_vaddr_, 0, fetch_paddr_);
+    if (cpu_core_.translation_pending) {
+      return;
+    }
     if (!fetch_ok_) {
       inst_word_ = 0;
       pre_req_ = {};
@@ -658,6 +796,25 @@ private:
     setup_read(fetch_req_, axi_interconnect::MASTER_ICACHE, kFetchReqId,
                fetch_paddr_, 3);
     stage_ = ExecStage::kWaitFetch;
+  }
+
+  void prepare_data_request() {
+    pre_req_ = decode_mem_req_pre_exec(cpu_core_, inst_word_);
+    if (cpu_core_.translation_pending) {
+      return;
+    }
+    if (pre_req_.valid) {
+      if (pre_req_.is_read) {
+        setup_read(data_req_, axi_interconnect::MASTER_DCACHE_R, kDataReqId,
+                   pre_req_.paddr, pre_req_.total_size);
+      } else {
+        setup_write(write_req_, kDataReqId, pre_req_.paddr, pre_req_.wdata,
+                    static_cast<uint8_t>(pre_req_.wstrb), pre_req_.total_size);
+      }
+      stage_ = ExecStage::kWaitData;
+      return;
+    }
+    stage_ = ExecStage::kExecute;
   }
 
   void check_limits() {
@@ -677,6 +834,29 @@ private:
       stage_ = ExecStage::kHalted;
       success_ = false;
     }
+
+    constexpr uint64_t kStallCycles = 2000000ULL;
+    if (!stall_reported_ &&
+        static_cast<uint64_t>(sim_time) > last_progress_time_ + kStallCycles &&
+        stage_ != ExecStage::kHalted) {
+      stall_reported_ = true;
+      std::fprintf(
+          stderr,
+          "[sc-axi4][stall] time=%llu inst=%llu stage=%s "
+          "mmu_pending=%d mmu_resp=%d mmu_addr=0x%08x mmu_req_active=%d "
+          "mmu_req_issued=%d mmu_beats=%u/%u mmu_req_ready=%d "
+          "arvalid=%d arready=%d arid=%u araddr=0x%08x\n",
+          static_cast<unsigned long long>(sim_time),
+          static_cast<unsigned long long>(inst_count_), stage_name(stage_),
+          mmu_hook_.pending ? 1 : 0, mmu_hook_.response_valid ? 1 : 0,
+          mmu_hook_.addr, mmu_req_.active ? 1 : 0, mmu_req_.issued ? 1 : 0,
+          mmu_req_.beats_seen, mmu_req_.beats_total, mmu_req_ready_ ? 1 : 0,
+          interconnect_.axi_io.ar.arvalid ? 1 : 0,
+          interconnect_.axi_io.ar.arready ? 1 : 0,
+          static_cast<unsigned>(interconnect_.axi_io.ar.arid),
+          interconnect_.axi_io.ar.araddr);
+      interconnect_.debug_print();
+    }
   }
 
   void fill_status(sc_sim_status_t &status) const {
@@ -686,7 +866,7 @@ private:
     status.success = success_ ? 1 : 0;
     status.wait_axi =
         (stage_ == ExecStage::kWaitFetch || stage_ == ExecStage::kWaitData ||
-         stage_ == ExecStage::kWaitAmoWrite)
+         stage_ == ExecStage::kWaitAmoWrite || mmu_req_.active)
             ? 1
             : 0;
     status.uart_valid = uart_valid_ ? 1 : 0;
@@ -694,7 +874,7 @@ private:
   }
 
 private:
-  RefCpu ref_cpu_{};
+  SingleCycleCpu cpu_core_{};
   axi_interconnect::AXI_Interconnect interconnect_{};
 
   ExecStage stage_ = ExecStage::kHalted;
@@ -705,6 +885,9 @@ private:
   uint64_t max_inst_ = MAX_COMMIT_INST;
   uint64_t max_cycles_ = 12000000000ULL;
   uint64_t inst_count_ = 0;
+  uint64_t last_inst_count_ = 0;
+  uint64_t last_progress_time_ = 0;
+  bool stall_reported_ = false;
 
   bool fetch_ok_ = false;
   uint32_t fetch_vaddr_ = 0;
@@ -713,13 +896,41 @@ private:
   DecodedMemReq pre_req_{};
   ReadReqState fetch_req_{};
   ReadReqState data_req_{};
+  ReadReqState mmu_req_{};
   WriteReqState write_req_{};
+  bool mmu_req_ready_ = false;
+  bool mmu_resp_valid_ = false;
+  MmuHookState mmu_hook_{};
 
   bool uart_valid_ = false;
   uint8_t uart_ch_ = 0;
 
   std::string last_error_{};
 };
+
+static CpuMemReadResult cpu_mem_read_hook(uint32_t paddr, uint32_t *data) {
+  if (g_active_sim == nullptr) {
+    return CPU_MEM_READ_FAULT;
+  }
+  return g_active_sim->on_cpu_mem_read(paddr, data);
+}
+
+static bool cpu_mem_read_now_hook(uint32_t paddr, uint32_t *data) {
+  if (p_memory == nullptr || data == nullptr) {
+    return false;
+  }
+  *data = p_memory[(paddr & ~0x3u) >> 2];
+  return true;
+}
+
+static bool cpu_mem_write_now_hook(uint32_t paddr, uint32_t data,
+                                   uint32_t wstrb) {
+  if (p_memory == nullptr) {
+    return false;
+  }
+  apply_wstrb_write(paddr, data, wstrb);
+  return true;
+}
 
 } // namespace
 
