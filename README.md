@@ -106,6 +106,8 @@ make demos -j8
 
 头文件：`include/sc_axi4_sim_api.h`
 
+AXI4 信号明细（按 AR/AW/W/R/B 通道划分 + 方向）：`docs/axi4_interface.md`
+
 关键接口：
 
 - `sc_sim_create/sc_sim_destroy`：创建/销毁句柄  
