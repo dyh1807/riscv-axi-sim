@@ -7,6 +7,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(ICACHE_MISS_LATENCY_VALUE 8 CACHE STRING "SimDDR latency cycles")
 set(SINGLE_CYCLE_EXE single_cycle_axi4.out)
+set(DEMO_STATIC_EXE demo_api_static.out)
+set(DEMO_SHARED_EXE demo_api_shared.out)
 
 set(CORE_SOURCES
     src/sc_axi4_sim_api.cpp
@@ -73,6 +75,41 @@ target_link_libraries(${SINGLE_CYCLE_EXE} PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/softfloat/softfloat.a
     z
     stdc++fs
+)
+
+add_executable(${DEMO_STATIC_EXE}
+    examples/demo_api_with_simddr.cpp
+    src/simddr/SimDDR.cpp
+)
+target_include_directories(${DEMO_STATIC_EXE} PRIVATE ${COMMON_INCLUDE_DIRS})
+target_compile_definitions(${DEMO_STATIC_EXE} PRIVATE ${COMMON_COMPILE_DEFS})
+target_compile_options(${DEMO_STATIC_EXE} PRIVATE ${COMMON_COMPILE_OPTIONS})
+target_link_libraries(${DEMO_STATIC_EXE} PRIVATE
+    single_cycle_axi4_static
+    ${CMAKE_SOURCE_DIR}/third_party/softfloat/softfloat.a
+    z
+    stdc++fs
+)
+set_target_properties(${DEMO_STATIC_EXE} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/examples
+)
+
+add_executable(${DEMO_SHARED_EXE}
+    examples/demo_api_with_simddr.cpp
+    src/simddr/SimDDR.cpp
+)
+target_include_directories(${DEMO_SHARED_EXE} PRIVATE ${COMMON_INCLUDE_DIRS})
+target_compile_definitions(${DEMO_SHARED_EXE} PRIVATE ${COMMON_COMPILE_DEFS})
+target_compile_options(${DEMO_SHARED_EXE} PRIVATE ${COMMON_COMPILE_OPTIONS})
+target_link_libraries(${DEMO_SHARED_EXE} PRIVATE
+    single_cycle_axi4_shared
+    ${CMAKE_SOURCE_DIR}/third_party/softfloat/softfloat.a
+    z
+    stdc++fs
+)
+set_target_properties(${DEMO_SHARED_EXE} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/examples
+    BUILD_RPATH "$ORIGIN/.."
 )
 
 add_custom_target(run_dhrystone

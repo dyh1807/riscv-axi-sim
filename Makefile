@@ -23,8 +23,10 @@ EXE_OBJS := $(EXE_SRCS:.cpp=.o)
 TARGET := single_cycle_axi4.out
 STATIC_LIB := libsingle_cycle_axi4.a
 SHARED_LIB := libsingle_cycle_axi4.so
+DEMO_STATIC := examples/demo_api_static.out
+DEMO_SHARED := examples/demo_api_shared.out
 
-.PHONY: all clean lib-static lib-shared libs run-dhrystone run-coremark run-linux
+.PHONY: all clean lib-static lib-shared libs demo-static demo-shared demos run-dhrystone run-coremark run-linux
 
 all: $(TARGET)
 
@@ -34,6 +36,12 @@ lib-static: $(STATIC_LIB)
 
 lib-shared: $(SHARED_LIB)
 
+demos: demo-static demo-shared
+
+demo-static: $(DEMO_STATIC)
+
+demo-shared: $(DEMO_SHARED)
+
 $(STATIC_LIB): $(CORE_OBJS)
 	ar rcs $@ $^
 
@@ -42,6 +50,12 @@ $(SHARED_LIB): $(CORE_OBJS)
 
 $(TARGET): $(EXE_OBJS) $(STATIC_LIB)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ $(LIBS) $(LDFLAGS) -o $@
+
+$(DEMO_STATIC): examples/demo_api_with_simddr.cpp src/simddr/SimDDR.cpp $(STATIC_LIB)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ $(LIBS) $(LDFLAGS) -o $@
+
+$(DEMO_SHARED): examples/demo_api_with_simddr.cpp src/simddr/SimDDR.cpp $(SHARED_LIB)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -L. -Wl,-rpath,'$$ORIGIN/..' $^ $(LIBS) -lsingle_cycle_axi4 $(LDFLAGS) -o $@
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -fPIC $(INCLUDES) -c $< -o $@
@@ -56,4 +70,4 @@ run-linux: $(TARGET)
 	./$(TARGET) bin/linux.bin
 
 clean:
-	rm -f $(TARGET) $(STATIC_LIB) $(SHARED_LIB) $(CORE_OBJS) $(EXE_OBJS)
+	rm -f $(TARGET) $(STATIC_LIB) $(SHARED_LIB) $(DEMO_STATIC) $(DEMO_SHARED) $(CORE_OBJS) $(EXE_OBJS)

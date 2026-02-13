@@ -6,6 +6,8 @@ a.out
 *.o
 libsingle_cycle_axi4.so
 libsingle_cycle_axi4.a
+examples/demo_api_static.out
+examples/demo_api_shared.out
 build/
 CMakeFiles/
 CMakeCache.txt

@@ -13,6 +13,8 @@
 singlecycle-axi4-sim/
 ├── CMakeLists.txt
 ├── Makefile
+├── examples/
+│   └── demo_api_with_simddr.cpp  # 库调用示例（同一源码可链接 .a/.so）
 ├── include/
 │   ├── sc_axi4_sim_api.h        # 对外 C API（周期步进）
 │   └── ...
@@ -61,11 +63,30 @@ make libs -j8            # 构建静态库+动态库
 - `single_cycle_axi4.out`
 - `libsingle_cycle_axi4.a`
 - `libsingle_cycle_axi4.so`
+- `examples/demo_api_static.out`
+- `examples/demo_api_shared.out`
 
 说明：
 
 - `libsingle_cycle_axi4.a` 可直接静态链接。  
 - 由于仓库内 `softfloat.a` 非 PIC，`libsingle_cycle_axi4.so` 采用未解析 softfloat 符号方式构建，宿主程序需提供 softfloat 符号（推荐直接使用静态库方案）。
+
+### Demo（调用静态库/动态库）
+
+Makefile:
+
+```bash
+make demos -j8
+```
+
+运行：
+
+```bash
+./examples/demo_api_static.out bin/dhrystone.bin --max-inst 2000000
+./examples/demo_api_shared.out bin/dhrystone.bin --max-inst 2000000
+```
+
+两者都调用同一个 C API：`sc_sim_create/sc_sim_load_image/sc_sim_step`。
 
 ## 运行可执行程序
 
