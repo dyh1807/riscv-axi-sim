@@ -68,6 +68,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // step0: 解析运行参数（镜像路径、最大指令数、最大周期数）
   std::string image_path;
   uint64_t max_inst = 150000000ULL;
   uint64_t max_cycles = 12000000000ULL;
@@ -92,12 +93,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // step1: 创建黑盒仿真器实例（内部是 CPU + Interconnect 状态机）
   sc_sim_handle *sim = sc_sim_create();
   if (sim == nullptr) {
     std::cerr << "create simulator failed" << std::endl;
     return 1;
   }
 
+  // step2: 配置停止条件并加载程序镜像（会重置内部状态机）
   sc_sim_set_limits(sim, max_inst, max_cycles);
 
   uint64_t image_size = 0;
@@ -107,6 +110,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // step3: 在 demo 侧构建一个“外部设备”示例：SimDDR
+  // 实际对接 FPGA 时，这里替换为板卡/外设接口收发逻辑即可。
   sim_ddr::SimDDR ddr;
   ddr.init();
   ddr.comb_outputs();
@@ -121,18 +126,27 @@ int main(int argc, char **argv) {
   sc_sim_status_t status{};
   int rc = 0;
   while (true) {
+    // step4: 采样外部设备本周期给出的 AXI 输入信号（slave -> master）
     sample_ddr_outputs(ddr.io, axi_in);
+
+    // step5: 推进黑盒仿真器一个周期：
+    // 输入为 step4 采样结果，输出为本周期 AXI 请求（master -> slave）
     rc = sc_sim_step(sim, &axi_in, &axi_out, &status);
 
+    // step6: 处理可选的 sideband 事件（此处为 UART 字符输出）
     if (status.uart_valid) {
       std::cout << static_cast<char>(status.uart_ch) << std::flush;
     }
 
+    // step7: 将黑盒输出 AXI 信号驱动到外部设备，并推进外设一个周期
+    // 这一步对应“对外发送请求 + 外设内部状态更新”。
     drive_ddr_inputs(ddr.io, axi_out);
     ddr.comb_inputs();
     ddr.seq();
     ddr.comb_outputs();
 
+    // step8: 判断当前周期是否结束运行
+    // rc == 0: 继续；rc > 0: 正常结束；rc < 0: 异常结束。
     if (rc != 0) {
       break;
     }

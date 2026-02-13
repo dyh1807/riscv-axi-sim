@@ -26,7 +26,7 @@ singlecycle-axi4-sim/
 │   └── ref/
 ├── third_party/softfloat/softfloat.a
 ├── tools/run_regression.sh
-└── bin/                         # 镜像文件（已 gitignore）
+└── bin/                         # 示例镜像（包含 coremark/dhrystone，不包含 linux）
 ```
 
 ## 环境依赖

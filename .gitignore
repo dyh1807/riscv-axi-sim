@@ -16,3 +16,5 @@ compile_commands.json
 
 bin/*
 !bin/.gitkeep
+!bin/coremark.bin
+!bin/dhrystone.bin
