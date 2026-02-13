@@ -1,0 +1,16 @@
+*.out
+a.out
+*.log
+*.tmp
+*.swp
+*.o
+libsingle_cycle_axi4.so
+libsingle_cycle_axi4.a
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+bin/*
+!bin/.gitkeep
