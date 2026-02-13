@@ -19,6 +19,9 @@ EXE_SRCS := src/main.cpp \
 
 CORE_OBJS := $(CORE_SRCS:.cpp=.o)
 EXE_OBJS := $(EXE_SRCS:.cpp=.o)
+CORE_DEPS := $(CORE_OBJS:.o=.d)
+EXE_DEPS := $(EXE_OBJS:.o=.d)
+DEPFILES := $(CORE_DEPS) $(EXE_DEPS)
 
 TARGET := single_cycle_axi4.out
 STATIC_LIB := libsingle_cycle_axi4.a
@@ -58,7 +61,9 @@ $(DEMO_SHARED): examples/demo_api_with_simddr.cpp src/simddr/SimDDR.cpp $(SHARED
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -L. -Wl,-rpath,'$$ORIGIN/..' $^ $(LIBS) -lsingle_cycle_axi4 $(LDFLAGS) -o $@
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -fPIC $(INCLUDES) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -fPIC $(INCLUDES) -MMD -MP -c $< -o $@
+
+-include $(DEPFILES)
 
 run-dhrystone: $(TARGET)
 	./$(TARGET) bin/dhrystone.bin
@@ -70,4 +75,4 @@ run-linux: $(TARGET)
 	./$(TARGET) bin/linux.bin
 
 clean:
-	rm -f $(TARGET) $(STATIC_LIB) $(SHARED_LIB) $(DEMO_STATIC) $(DEMO_SHARED) $(CORE_OBJS) $(EXE_OBJS)
+	rm -f $(TARGET) $(STATIC_LIB) $(SHARED_LIB) $(DEMO_STATIC) $(DEMO_SHARED) $(CORE_OBJS) $(EXE_OBJS) $(DEPFILES)

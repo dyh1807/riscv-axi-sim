@@ -4,6 +4,7 @@ a.out
 *.tmp
 *.swp
 *.o
+*.d
 libsingle_cycle_axi4.so
 libsingle_cycle_axi4.a
 examples/demo_api_static.out
