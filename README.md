@@ -7,6 +7,51 @@
 
 核心目标是把 CPU+Interconnect 封装为黑盒：外部每拍给 AXI 输入，模块每拍返回 AXI 输出。
 
+## 架构连线（ASCII）
+
+### 1) CLI 本地回归模式（`single_cycle_axi4.out` + `SimDDR`）
+
+```text
+      (周期推进: main.cpp for-loop)
+ ┌──────────────────────┐            AXI4 master/slave handshake
+ │  RV32 单周期核心     │  AR/AW/W  ───────────────────────────▶
+ │  (SingleCycleCpu)    │  R/B      ◀───────────────────────────
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │ AXI Interconnect     │
+ └──────────┬───────────┘
+            │ AXI4 总线
+            ▼
+ ┌──────────────────────┐
+ │ SimDDR(AXI4 Slave)   │
+ └──────────┬───────────┘
+            │
+            ▼
+       DDR/内存镜像(p_memory)
+```
+
+### 2) 库集成模式（外部 SoC/DDR 驱动）
+
+```text
+     +--------------------------------------------------------------+
+     |                    你的 SoC/验证环境                         |
+     |  (DDR 控制器 / 外设模型 / FPGA 侧 AXI 逻辑，按周期驱动)     |
+     +--------------------------┬-----------------------------------+
+                                │  sc_axi4_in_t / sc_axi4_out_t
+                                │  (AR/AW/W/R/B 全通道)
+                                ▼
+                    +-------------------------------+
+                    |  sc_sim_step(...) 黑盒        |
+                    |  [RV32 Core + Interconnect]   |
+                    +-------------------------------+
+```
+
+说明：
+- 在库模式下，`sc_sim_step` 一次调用对应一个仿真周期。
+- 外部系统只需要关心 AXI4 端口输入输出，不需要感知内部 CPU/Interconnect 实现细节。
+
 ## 目录
 
 ```text
@@ -23,7 +68,7 @@ singlecycle-axi4-sim/
 │   ├── main.cpp                 # CLI：API + SimDDR 适配器
 │   ├── axi/
 │   ├── simddr/
-│   └── ref/
+│   └── cpu/
 ├── third_party/softfloat/softfloat.a
 ├── tools/run_regression.sh
 └── bin/                         # 示例镜像（包含 coremark/dhrystone，不包含 linux）
