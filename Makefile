@@ -11,7 +11,7 @@ LDFLAGS := -lz -lstdc++fs
 LIBS := ./third_party/softfloat/softfloat.a
 
 CORE_SRCS := src/sc_axi4_sim_api.cpp \
-             src/cpu/single_cycle_cpu_standalone.cpp \
+             src/cpu/single_cycle_cpu.cpp \
              src/axi/AXI_Interconnect.cpp
 
 EXE_SRCS := src/main.cpp \

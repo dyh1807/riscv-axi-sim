@@ -148,13 +148,6 @@ using namespace std;
 #define CONFIG_CACHE
 // #define ENABLE_MULTI_BR
 
-/*
- * 宽松的va2pa检查：
- * 允许 DUT 判定为 page fault，但是 REF 判定不为
- * page fault 时，通过 DIFFTEST 并以 DUT 为准
- */
-#define CONFIG_LOOSE_VA2PA
-
 #define UART_BASE 0x10000000
 #define MMIO_BASE UART_BASE
 #define MMIO_SIZE 0x00001000

@@ -12,7 +12,7 @@ set(DEMO_SHARED_EXE demo_api_shared.out)
 
 set(CORE_SOURCES
     src/sc_axi4_sim_api.cpp
-    src/cpu/single_cycle_cpu_standalone.cpp
+    src/cpu/single_cycle_cpu.cpp
     src/axi/AXI_Interconnect.cpp
 )
 
