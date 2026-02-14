@@ -155,3 +155,24 @@ tools/run_regression.sh
 ```
 
 脚本会优先使用 CMake；若找不到 `cmake`，会回退到 `make`。
+
+## Commit 规范与硬性检查
+
+本仓库提供版本化 `commit-msg` hook 与 lint 工具：
+
+- `.githooks/commit-msg`
+- `tools/commit_msg_lint.py`
+
+一次性启用：
+
+```bash
+bash tools/setup_githooks.sh
+```
+
+或：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+启用后，`git commit` 会自动检查提交信息格式，并拒绝字面量 `\\n`（必须使用真实换行）。

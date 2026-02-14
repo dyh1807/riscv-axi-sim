@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MSG_FILE="${1:?commit message file is required}"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+python3 "${REPO_ROOT}/tools/commit_msg_lint.py" --file "${MSG_FILE}"
+
